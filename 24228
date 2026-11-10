@@ -1,0 +1,49 @@
+# InkNotes - Samsung Notes-inspired app (Phase 1 + Phase 2a)
+
+Kotlin + Jetpack Compose (Material 3, One UI feel), Clean Architecture/MVVM, Hilt, Room, Flow.
+Target device: Samsung Galaxy Tab S10 Lite (S Pen). Android Studio: open the folder, sync, run on tablet/emulator.
+
+**Status: NOT compiled yet** (no Android SDK / network where this was generated). Dependency versions are
+placeholders - bump AGP/Kotlin/KSP/Hilt together in Android Studio. `androidx.graphics` low-latency API
+(`CanvasFrontBufferedRenderer`) may need small signature tweaks for your exact version.
+
+## Layout
+```
+domain/      models (Stroke, PenType...), UndoRedoStack (200 steps)
+data/        Room (notes, folders, pages, tags), StrokeFileStore (chunked JSON), NotesRepository, Hilt module
+ink/         InkSurfaceView (low-latency S Pen), StrokeRenderer, PenSpecs, TemplateRenderer
+ui/home      collapsing One UI header, drawer, nested folders, grid/list modes, search
+ui/editor    3 layers: Compose paper/template -> (rich text, Phase 2) -> ink SurfaceView; pen toolbar
+```
+
+## Phase 1 (in this zip)
+- Home: collapsing large app bar, drawer (permanent on tablet), nested folders with colour + total count,
+  Grid S/M/L + List + Simple list, pinned first, trash (30-day purge), title/text search, long-press pin/trash
+- Editor: low-latency stylus ink, pressure + tilt, 5 pens + 2 highlighters (+ straight snap), stroke eraser
+  (+ "erase highlighter only"), S Pen button / eraser tip = eraser, finger-draw toggle, palm rejection,
+  pinch-zoom + pan, templates (blank, 3 rulings, grid, dotted), dark paper, undo/redo, auto-save after every stroke
+
+## Phase 2a (added)
+- Rich-text layer (Text mode): block based - bold / italic / underline / strike, size, colour, highlight,
+  alignment, bullets, indent, interactive checklists (tick = strikethrough). Formatting is per line/block,
+  not per character (per-character spans = later). Typed text feeds the home-screen search index.
+- Draw/Text toggle in the top bar. In Text mode finger pan/zoom is off (switch back to Draw to pan).
+
+## Get an APK without Android Studio
+Push this folder to a GitHub repo (branch `main`): Actions -> "Build debug APK" -> download artifact
+`InkNotes-debug-apk` -> install `app-debug.apk` on the tablet (allow unknown sources). Or in Android Studio:
+Build > Build APK(s). Expect a few compile errors on the very first build (never compiled yet) - fix/ask.
+
+## Next phases
+- Phase 2b: floating text boxes, area eraser, lasso, shape snap/straighten,
+  ML Kit handwriting-to-text + OCR index, favourites dock, colour picker/eyedropper, multi-page + page sorter,
+  Cornell/planner/music templates, page thumbnails, PDF import/markup (PdfRenderer), image editing
+- Phase 3: audio-synced strokes, biometric AES-256 note lock, exports (PDF/DOCX/PPTX/PNG/TXT),
+  Easy Writing Pad, reading mode, shared notebooks (needs a backend)
+
+## Tab S10 Lite notes
+- Mid-range chip: next perf step is caching committed strokes in a bitmap/tile cache (currently the multi
+  buffer redraws every stroke on commit/pan/zoom - fine for hundreds, not thousands). Add a Baseline Profile.
+- Manifest already: resizeable (split-screen/DeX), configChanges so rotation doesn't recreate the ink surface.
+- Highlighter Multiply only applies on export/flatten; live overlay approximates with alpha.
+- Don't ship Samsung branding/assets - behaviour is inspired, visuals are your own.
