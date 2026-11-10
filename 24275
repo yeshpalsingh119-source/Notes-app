@@ -1,0 +1,31 @@
+package com.example.inknotes.domain.model
+
+import kotlinx.serialization.Serializable
+import java.util.UUID
+
+@Serializable
+enum class BlockKind { PARAGRAPH, BULLET, CHECKLIST }
+
+/**
+ * Rich-text layer is block based: one block = one paragraph / bullet / checklist line.
+ * Formatting (bold, size, colour, highlight, alignment, indent) applies per block, not per character.
+ * colorArgb / highlightArgb == 0 means "default / none". align: 0 start, 1 center, 2 end.
+ */
+@Serializable
+data class TextBlock(
+    val id: String = newBlockId(),
+    val text: String = "",
+    val kind: BlockKind = BlockKind.PARAGRAPH,
+    val checked: Boolean = false,
+    val bold: Boolean = false,
+    val italic: Boolean = false,
+    val underline: Boolean = false,
+    val strike: Boolean = false,
+    val sizeSp: Int = 18,
+    val colorArgb: Int = 0,
+    val highlightArgb: Int = 0,
+    val align: Int = 0,
+    val indent: Int = 0
+)
+
+fun newBlockId(): String = UUID.randomUUID().toString()

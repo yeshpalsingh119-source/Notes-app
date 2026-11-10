@@ -1,0 +1,62 @@
+package com.example.inknotes.data.db
+
+import androidx.room.ColumnInfo
+import androidx.room.Embedded
+import androidx.room.Entity
+import androidx.room.ForeignKey
+import androidx.room.Index
+import androidx.room.PrimaryKey
+
+@Entity(tableName = "notes", indices = [Index("folderId"), Index("updatedAt")])
+data class NoteEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val title: String = "",
+    val folderId: Long? = null,
+    val isPinned: Boolean = false,
+    val isLocked: Boolean = false,
+    val openCount: Int = 0,
+    val paperColor: Int = 0xFFFFFFFF.toInt(),
+    val infiniteScroll: Boolean = false,
+    /** Typed text + OCR text + PDF text, lower-cased by the indexer. Feeds deep search. */
+    val searchText: String = "",
+    val createdAt: Long,
+    val updatedAt: Long,
+    val deletedAt: Long? = null           // non-null = in Trash (30-day auto purge)
+)
+
+@Entity(tableName = "folders", indices = [Index("parentId")])
+data class FolderEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val parentId: Long? = null,           // unlimited nesting
+    val name: String,
+    val colorArgb: Int
+)
+
+@Entity(
+    tableName = "pages",
+    foreignKeys = [ForeignKey(NoteEntity::class, ["id"], ["noteId"], onDelete = ForeignKey.CASCADE)],
+    indices = [Index("noteId")]
+)
+data class PageEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val noteId: Long,
+    val position: Int,
+    val template: String = "BLANK",
+    val bookmarked: Boolean = false,
+    val richTextJson: String = ""         // Phase 2: rich-text layer
+)
+
+@Entity(tableName = "tags")
+data class TagEntity(
+    @PrimaryKey(autoGenerate = true) val id: Long = 0,
+    val name: String,
+    val colorArgb: Int
+)
+
+@Entity(tableName = "note_tags", primaryKeys = ["noteId", "tagId"], indices = [Index("tagId")])
+data class NoteTagCrossRef(val noteId: Long, val tagId: Long)
+
+data class FolderWithCount(
+    @Embedded val folder: FolderEntity,
+    @ColumnInfo(name = "noteCount") val noteCount: Int
+)

@@ -1,0 +1,72 @@
+package com.example.inknotes.data.repository
+
+import com.example.inknotes.data.db.*
+import com.example.inknotes.domain.model.PageTemplate
+import com.example.inknotes.domain.model.Stroke
+import kotlinx.coroutines.flow.Flow
+import javax.inject.Inject
+import javax.inject.Singleton
+
+data class NoteFilter(
+    val trashed: Boolean = false,
+    val lockedOnly: Boolean = false,
+    val frequent: Boolean = false,
+    val folderId: Long? = null,
+    val query: String = ""
+)
+
+@Singleton
+class NotesRepository @Inject constructor(
+    private val notes: NoteDao,
+    private val pages: PageDao,
+    private val folders: FolderDao,
+    private val store: StrokeFileStore
+) {
+    private fun now() = System.currentTimeMillis()
+
+    fun observeNotes(f: NoteFilter): Flow<List<NoteEntity>> =
+        notes.observe(f.trashed, f.lockedOnly, f.frequent, f.folderId, f.query.trim())
+
+    fun observeFolders(): Flow<List<FolderWithCount>> = folders.observeAll()
+
+    suspend fun createNote(folderId: Long?): Long {
+        val t = now()
+        val id = notes.insert(NoteEntity(folderId = folderId, createdAt = t, updatedAt = t))
+        pages.insert(PageEntity(noteId = id, position = 0))
+        return id
+    }
+
+    suspend fun createFolder(name: String, parentId: Long?, color: Int) =
+        folders.insert(FolderEntity(parentId = parentId, name = name, colorArgb = color))
+
+    suspend fun firstPage(noteId: Long): PageEntity =
+        pages.first(noteId) ?: PageEntity(noteId = noteId, position = 0).let { it.copy(id = pages.insert(it)) }
+
+    suspend fun title(noteId: Long) = notes.title(noteId).orEmpty()
+    suspend fun setTitle(noteId: Long, t: String) = notes.setTitle(noteId, t, now())
+    suspend fun markOpened(noteId: Long) = notes.markOpened(noteId)
+    suspend fun setTemplate(pageId: Long, t: PageTemplate) = pages.setTemplate(pageId, t.name)
+
+    /** Saves the rich-text layer and refreshes the note's search index with the typed text. */
+    suspend fun saveRichText(noteId: Long, pageId: Long, json: String, plainText: String) {
+        pages.setRichText(pageId, json)
+        notes.setSearchText(noteId, plainText, now())
+    }
+
+    suspend fun loadStrokes(pageId: Long): List<Stroke> = store.load(pageId)
+    suspend fun saveStrokes(noteId: Long, pageId: Long, strokes: List<Stroke>) {
+        store.save(pageId, strokes)
+        notes.touch(noteId, now())
+    }
+
+    suspend fun togglePin(n: NoteEntity) = notes.setPinned(n.id, !n.isPinned)
+    suspend fun moveToTrash(id: Long) = notes.setDeleted(id, now())
+    suspend fun restore(id: Long) = notes.setDeleted(id, null)
+
+    /** Trash auto-delete after 30 days (also remove stroke files). Call on app start / via WorkManager. */
+    suspend fun purgeTrash() {
+        val cutoff = now() - 30L * 24 * 60 * 60 * 1000
+        pages.expiredPageIds(cutoff).forEach { store.delete(it) }
+        notes.purge(cutoff)
+    }
+}

@@ -1,0 +1,60 @@
+package com.example.inknotes.data.db
+
+import androidx.room.Dao
+import androidx.room.Insert
+import androidx.room.Query
+import androidx.room.Update
+import kotlinx.coroutines.flow.Flow
+
+@Dao
+interface NoteDao {
+    @Query(
+        """
+        SELECT * FROM notes
+        WHERE ((:trashed = 1 AND deletedAt IS NOT NULL) OR (:trashed = 0 AND deletedAt IS NULL))
+          AND (:lockedOnly = 0 OR isLocked = 1)
+          AND (:frequent = 0 OR openCount > 0)
+          AND (:folderId IS NULL OR folderId = :folderId)
+          AND (:q = '' OR title LIKE '%' || :q || '%' OR searchText LIKE '%' || :q || '%')
+        ORDER BY isPinned DESC, CASE WHEN :frequent = 1 THEN openCount END DESC, updatedAt DESC
+        """
+    )
+    fun observe(trashed: Boolean, lockedOnly: Boolean, frequent: Boolean, folderId: Long?, q: String): Flow<List<NoteEntity>>
+
+    @Insert suspend fun insert(n: NoteEntity): Long
+    @Update suspend fun update(n: NoteEntity)
+
+    @Query("SELECT title FROM notes WHERE id = :id") suspend fun title(id: Long): String?
+    @Query("UPDATE notes SET title = :t, updatedAt = :ts WHERE id = :id") suspend fun setTitle(id: Long, t: String, ts: Long)
+    @Query("UPDATE notes SET searchText = :t, updatedAt = :ts WHERE id = :id") suspend fun setSearchText(id: Long, t: String, ts: Long)
+    @Query("UPDATE notes SET isPinned = :pinned WHERE id = :id") suspend fun setPinned(id: Long, pinned: Boolean)
+    @Query("UPDATE notes SET deletedAt = :ts WHERE id = :id") suspend fun setDeleted(id: Long, ts: Long?)
+    @Query("UPDATE notes SET updatedAt = :ts WHERE id = :id") suspend fun touch(id: Long, ts: Long)
+    @Query("UPDATE notes SET openCount = openCount + 1 WHERE id = :id") suspend fun markOpened(id: Long)
+    @Query("DELETE FROM notes WHERE deletedAt IS NOT NULL AND deletedAt < :cutoff") suspend fun purge(cutoff: Long)
+}
+
+@Dao
+interface PageDao {
+    @Insert suspend fun insert(p: PageEntity): Long
+    @Query("SELECT * FROM pages WHERE id = :id") suspend fun get(id: Long): PageEntity?
+    @Query("SELECT * FROM pages WHERE noteId = :noteId ORDER BY position LIMIT 1") suspend fun first(noteId: Long): PageEntity?
+    @Query("UPDATE pages SET template = :t WHERE id = :id") suspend fun setTemplate(id: Long, t: String)
+    @Query("UPDATE pages SET richTextJson = :json WHERE id = :id") suspend fun setRichText(id: Long, json: String)
+    @Query(
+        "SELECT p.id FROM pages p JOIN notes n ON n.id = p.noteId " +
+            "WHERE n.deletedAt IS NOT NULL AND n.deletedAt < :cutoff"
+    )
+    suspend fun expiredPageIds(cutoff: Long): List<Long>
+}
+
+@Dao
+interface FolderDao {
+    @Insert suspend fun insert(f: FolderEntity): Long
+
+    @Query(
+        "SELECT f.*, (SELECT COUNT(*) FROM notes n WHERE n.folderId = f.id AND n.deletedAt IS NULL) AS noteCount " +
+            "FROM folders f ORDER BY f.name COLLATE NOCASE"
+    )
+    fun observeAll(): Flow<List<FolderWithCount>>
+}

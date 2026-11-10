@@ -1,0 +1,27 @@
+package com.example.inknotes.ink
+
+import android.graphics.Paint
+import com.example.inknotes.domain.model.PenType
+
+/** Width = stroke.width * lerp(minW, maxW, pressure). Highlighters ignore pressure and render as one Path. */
+data class PenSpec(
+    val minW: Float,
+    val maxW: Float,
+    val alpha: Float,
+    val cap: Paint.Cap,
+    val nibAngleDeg: Float? = null,   // calligraphy: width depends on stroke direction vs nib angle
+    val tiltShading: Boolean = false, // pencil: tilt -> wider + lighter
+    val asPath: Boolean = false       // highlighters: single path avoids dark overlaps at joints
+)
+
+object PenSpecs {
+    fun of(t: PenType): PenSpec = when (t) {
+        PenType.FOUNTAIN -> PenSpec(0.4f, 1.5f, 1f, Paint.Cap.ROUND)
+        PenType.CALLIGRAPHY -> PenSpec(0.9f, 1.1f, 1f, Paint.Cap.ROUND, nibAngleDeg = 40f)
+        PenType.BALLPOINT -> PenSpec(0.85f, 1.0f, 1f, Paint.Cap.ROUND)
+        PenType.PENCIL -> PenSpec(0.6f, 1.2f, 0.8f, Paint.Cap.ROUND, tiltShading = true)
+        PenType.BRUSH -> PenSpec(0.2f, 2.5f, 1f, Paint.Cap.ROUND)
+        PenType.HIGHLIGHTER_ROUND -> PenSpec(4f, 4f, 0.4f, Paint.Cap.ROUND, asPath = true)
+        PenType.HIGHLIGHTER_CHISEL -> PenSpec(4f, 4f, 0.4f, Paint.Cap.SQUARE, asPath = true)
+    }
+}

@@ -1,0 +1,43 @@
+package com.example.inknotes.domain.model
+
+import kotlinx.serialization.Serializable
+
+/** Page-space coordinates (independent of zoom/pan). tMs = ms since stroke start (for audio sync later). */
+@Serializable
+data class StrokePoint(
+    val x: Float, val y: Float,
+    val pressure: Float, val tilt: Float, val orientation: Float,
+    val tMs: Long
+)
+
+@Serializable
+enum class PenType(val label: String, val isHighlighter: Boolean = false) {
+    FOUNTAIN("Fountain"),
+    CALLIGRAPHY("Calligraphy"),
+    BALLPOINT("Ballpoint"),
+    PENCIL("Pencil"),
+    BRUSH("Brush"),
+    HIGHLIGHTER_ROUND("Highlighter", true),
+    HIGHLIGHTER_CHISEL("Chisel", true)
+}
+
+@Serializable
+data class Stroke(
+    val id: String,
+    val pen: PenType,
+    val colorArgb: Int,
+    val width: Float,
+    val points: List<StrokePoint>,
+    val recordingId: String? = null,       // Phase 3: audio sync
+    val recordingOffsetMs: Long? = null
+)
+
+enum class Tool { PEN, ERASER }
+
+enum class PageTemplate { BLANK, RULED_NARROW, RULED_MEDIUM, RULED_WIDE, GRID, DOTTED }
+
+sealed interface EditAction {
+    val strokes: List<Stroke>
+    data class Add(override val strokes: List<Stroke>) : EditAction
+    data class Remove(override val strokes: List<Stroke>) : EditAction
+}

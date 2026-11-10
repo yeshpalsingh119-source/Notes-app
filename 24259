@@ -1,0 +1,48 @@
+package com.example.inknotes.ink
+
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.graphics.RectF
+import com.example.inknotes.domain.model.PageTemplate
+import kotlin.math.floor
+
+/** Page paper + template lines for the visible page-space rect. Cornell/Planner/Music = Phase 2. */
+object TemplateRenderer {
+    private val fill = Paint()
+    private val line = Paint(Paint.ANTI_ALIAS_FLAG).apply { strokeWidth = 1f }
+
+    fun draw(c: Canvas, t: PageTemplate, v: RectF, paper: Int, ink: Int, zoom: Float) {
+        fill.color = paper
+        c.drawRect(v, fill)
+        line.color = ink
+        line.alpha = 0x30
+        line.strokeWidth = 1f / zoom.coerceAtLeast(0.1f)
+        when (t) {
+            PageTemplate.BLANK -> Unit
+            PageTemplate.RULED_NARROW -> horizontal(c, v, 28f)
+            PageTemplate.RULED_MEDIUM -> horizontal(c, v, 36f)
+            PageTemplate.RULED_WIDE -> horizontal(c, v, 48f)
+            PageTemplate.GRID -> { horizontal(c, v, 36f); vertical(c, v, 36f) }
+            PageTemplate.DOTTED -> dots(c, v, 36f, 1.6f / zoom.coerceAtLeast(0.1f))
+        }
+    }
+
+    private fun horizontal(c: Canvas, v: RectF, step: Float) {
+        var y = floor(v.top / step) * step
+        while (y <= v.bottom) { c.drawLine(v.left, y, v.right, y, line); y += step }
+    }
+
+    private fun vertical(c: Canvas, v: RectF, step: Float) {
+        var x = floor(v.left / step) * step
+        while (x <= v.right) { c.drawLine(x, v.top, x, v.bottom, line); x += step }
+    }
+
+    private fun dots(c: Canvas, v: RectF, step: Float, r: Float) {
+        var y = floor(v.top / step) * step
+        while (y <= v.bottom) {
+            var x = floor(v.left / step) * step
+            while (x <= v.right) { c.drawCircle(x, y, r, line); x += step }
+            y += step
+        }
+    }
+}

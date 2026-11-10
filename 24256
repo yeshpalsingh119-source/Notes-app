@@ -1,0 +1,94 @@
+package com.example.inknotes.ui.home
+
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.inknotes.data.db.FolderWithCount
+import com.example.inknotes.data.db.NoteEntity
+import com.example.inknotes.data.repository.NoteFilter
+import com.example.inknotes.data.repository.NotesRepository
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.FlowPreview
+import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.launch
+import javax.inject.Inject
+
+enum class ViewMode(val label: String, val minCell: Dp?) {
+    GRID_SMALL("Small grid", 140.dp),
+    GRID_MEDIUM("Medium grid", 200.dp),
+    GRID_LARGE("Large grid", 280.dp),
+    LIST("List", null),
+    SIMPLE_LIST("Simple list", null)
+}
+
+sealed interface Destination {
+    data object All : Destination
+    data object Frequent : Destination
+    data object Locked : Destination
+    data object Trash : Destination
+    data class Folder(val id: Long) : Destination
+}
+
+data class FolderRow(val id: Long, val name: String, val colorArgb: Int, val depth: Int, val totalCount: Int)
+
+/** Flattens the folder tree (unlimited depth); totalCount includes all sub-folders. */
+fun flattenFolders(all: List<FolderWithCount>): List<FolderRow> {
+    val byParent = all.groupBy { it.folder.parentId }
+    fun total(f: FolderWithCount, depth: Int): Int =
+        f.noteCount + if (depth > 32) 0 else byParent[f.folder.id].orEmpty().sumOf { total(it, depth + 1) }
+    fun walk(parent: Long?, depth: Int): List<FolderRow> =
+        if (depth > 32) emptyList() else byParent[parent].orEmpty().flatMap { f ->
+            listOf(FolderRow(f.folder.id, f.folder.name, f.folder.colorArgb, depth, total(f, depth))) + walk(f.folder.id, depth + 1)
+        }
+    return walk(null, 0)
+}
+
+@OptIn(ExperimentalCoroutinesApi::class, FlowPreview::class)
+@HiltViewModel
+class HomeViewModel @Inject constructor(private val repo: NotesRepository) : ViewModel() {
+
+    private val _destination = MutableStateFlow<Destination>(Destination.All)
+    val destination: StateFlow<Destination> = _destination.asStateFlow()
+
+    private val _query = MutableStateFlow("")
+    val query: StateFlow<String> = _query.asStateFlow()
+
+    private val _viewMode = MutableStateFlow(ViewMode.GRID_MEDIUM)
+    val viewMode: StateFlow<ViewMode> = _viewMode.asStateFlow()
+
+    val notes: StateFlow<List<NoteEntity>> =
+        combine(_destination, _query.debounce(150)) { d, q ->
+            NoteFilter(
+                trashed = d == Destination.Trash,
+                lockedOnly = d == Destination.Locked,
+                frequent = d == Destination.Frequent,
+                folderId = (d as? Destination.Folder)?.id,
+                query = q
+            )
+        }.flatMapLatest { repo.observeNotes(it) }
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    val folders: StateFlow<List<FolderRow>> =
+        repo.observeFolders().map(::flattenFolders)
+            .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), emptyList())
+
+    init { viewModelScope.launch { repo.purgeTrash() } }
+
+    fun select(d: Destination) { _destination.value = d }
+    fun setQuery(q: String) { _query.value = q }
+    fun setViewMode(m: ViewMode) { _viewMode.value = m }
+
+    fun newNote(onCreated: (Long) -> Unit) = viewModelScope.launch {
+        onCreated(repo.createNote((destination.value as? Destination.Folder)?.id))
+    }
+
+    fun newFolder(name: String, color: Int) = viewModelScope.launch {
+        repo.createFolder(name.trim(), (destination.value as? Destination.Folder)?.id, color)
+    }
+
+    fun togglePin(n: NoteEntity) = viewModelScope.launch { repo.togglePin(n) }
+    fun trash(id: Long) = viewModelScope.launch { repo.moveToTrash(id) }
+    fun restore(id: Long) = viewModelScope.launch { repo.restore(id) }
+}

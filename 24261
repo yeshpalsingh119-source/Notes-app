@@ -1,0 +1,265 @@
+package com.example.inknotes.ink
+
+import android.content.Context
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.PixelFormat
+import android.graphics.PorterDuff
+import android.view.MotionEvent
+import android.view.ScaleGestureDetector
+import android.view.SurfaceView
+import androidx.graphics.lowlatency.CanvasFrontBufferedRenderer
+import com.example.inknotes.domain.model.EditAction
+import com.example.inknotes.domain.model.PenType
+import com.example.inknotes.domain.model.Stroke
+import com.example.inknotes.domain.model.StrokePoint
+import com.example.inknotes.domain.model.Tool
+import java.util.UUID
+import kotlin.math.hypot
+
+/**
+ * Transparent, low-latency ink overlay (S Pen):
+ *  - live segments go to the FRONT buffer (skips the normal compositor pipeline -> minimal latency)
+ *  - on pen-up the stroke is committed and the MULTI buffer redraws all committed strokes
+ *  - stylus = draw/erase; finger = pan/pinch-zoom (or draw if fingerDrawing); palm touches ignored while pen is down
+ *  - S Pen button / eraser tip = temporary eraser
+ * Paper + template are drawn by Compose underneath, driven by viewportListener.
+ */
+class InkSurfaceView(context: Context) : SurfaceView(context) {
+
+    fun interface EditListener { fun onEdit(action: EditAction) }
+    private class Segment(val a: StrokePoint, val b: StrokePoint)
+
+    // ---- configuration (set from Compose) ----
+    var editListener: EditListener? = null
+    var viewportListener: ((scale: Float, tx: Float, ty: Float) -> Unit)? = null
+    var tool = Tool.PEN
+    var pen = PenType.FOUNTAIN
+    var penColor = Color.BLACK
+    var penWidth = 3f
+    var fingerDrawing = false
+    var straightHighlighter = false
+    var eraseHighlighterOnly = false
+
+    // ---- viewport (page space -> screen) ----
+    @Volatile private var scale = 1f
+    @Volatile private var tx = 0f
+    @Volatile private var ty = 0f
+
+    /** Committed strokes (immutable list, replaced wholesale; read on the render thread). */
+    @Volatile
+    var strokes: List<Stroke> = emptyList()
+        set(value) {
+            // Local edits already updated this list; skip the echo coming back from the ViewModel.
+            if (field.size == value.size && field.lastOrNull()?.id == value.lastOrNull()?.id) return
+            field = value
+            renderer.commit()
+        }
+
+    // ---- live stroke state ----
+    private var live: MutableList<StrokePoint>? = null
+    private var liveIsStylus = false
+    private var strokeStart = 0L
+    @Volatile private var activePen = PenType.FOUNTAIN
+    @Volatile private var activeColor = Color.BLACK
+    @Volatile private var activeWidth = 3f
+    private val erased = mutableListOf<Stroke>()
+
+    // ---- gestures ----
+    private var lastFx = 0f
+    private var lastFy = 0f
+    private var fx = 0f
+    private var fy = 0f
+    private val scaleDetector = ScaleGestureDetector(context, object : ScaleGestureDetector.SimpleOnScaleGestureListener() {
+        override fun onScale(d: ScaleGestureDetector): Boolean {
+            val ns = (scale * d.scaleFactor).coerceIn(0.5f, 6f)
+            val k = ns / scale
+            tx = d.focusX - k * (d.focusX - tx)
+            ty = d.focusY - k * (d.focusY - ty)
+            scale = ns
+            notifyViewport()
+            return true
+        }
+    })
+
+    private val strokeRenderer = StrokeRenderer(multiplyHighlighters = false)
+
+    private val callback = object : CanvasFrontBufferedRenderer.Callback<Segment> {
+        override fun onDrawFrontBufferedLayer(canvas: Canvas, bufferWidth: Int, bufferHeight: Int, param: Segment) {
+            canvas.save()
+            canvas.translate(tx, ty)
+            canvas.scale(scale, scale)
+            strokeRenderer.segment(canvas, param.a, param.b, activePen, activeColor, activeWidth)
+            canvas.restore()
+        }
+
+        override fun onDrawMultiBufferedLayer(
+            canvas: Canvas, bufferWidth: Int, bufferHeight: Int, params: Collection<Segment>
+        ) {
+            canvas.drawColor(Color.TRANSPARENT, PorterDuff.Mode.CLEAR)
+            canvas.save()
+            canvas.translate(tx, ty)
+            canvas.scale(scale, scale)
+            for (s in strokes) strokeRenderer.draw(canvas, s)
+            canvas.restore()
+        }
+    }
+
+    init {
+        setZOrderOnTop(true)                       // sits above the Compose paper layer
+        holder.setFormat(PixelFormat.TRANSLUCENT)  // ...but stays transparent
+    }
+
+    private val renderer = CanvasFrontBufferedRenderer(this, callback)
+
+    fun release() = renderer.release(true)
+
+    // ------------------------------------------------------------------ touch
+    override fun onTouchEvent(e: MotionEvent): Boolean {
+        val type = e.getToolType(0)
+        val isStylus = type == MotionEvent.TOOL_TYPE_STYLUS || type == MotionEvent.TOOL_TYPE_ERASER
+
+        if (!isStylus) {
+            if (live != null && liveIsStylus) return true            // palm rejection
+            val drawWithFinger = fingerDrawing && e.pointerCount == 1 &&
+                (live != null || e.actionMasked == MotionEvent.ACTION_DOWN)
+            if (!drawWithFinger) {
+                if (live != null) cancelStroke()
+                return handleGesture(e)
+            }
+        }
+
+        val erasing = tool == Tool.ERASER ||
+            type == MotionEvent.TOOL_TYPE_ERASER ||
+            (e.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY) != 0
+
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                parent?.requestDisallowInterceptTouchEvent(true)
+                liveIsStylus = isStylus
+                if (erasing) eraseAt(e) else beginStroke(e)
+            }
+            MotionEvent.ACTION_MOVE -> if (erasing) eraseAt(e) else extendStroke(e)
+            MotionEvent.ACTION_UP -> finish()
+            MotionEvent.ACTION_CANCEL -> { cancelStroke(); erased.clear() }
+        }
+        return true
+    }
+
+    // ------------------------------------------------------------------ pen
+    private fun point(e: MotionEvent, h: Int): StrokePoint {
+        val x: Float; val y: Float; val p: Float; val t: Float; val o: Float; val time: Long
+        if (h < 0) {
+            x = e.x; y = e.y; p = e.pressure
+            t = e.getAxisValue(MotionEvent.AXIS_TILT); o = e.getAxisValue(MotionEvent.AXIS_ORIENTATION)
+            time = e.eventTime
+        } else {
+            x = e.getHistoricalX(h); y = e.getHistoricalY(h); p = e.getHistoricalPressure(h)
+            t = e.getHistoricalAxisValue(MotionEvent.AXIS_TILT, 0, h)
+            o = e.getHistoricalAxisValue(MotionEvent.AXIS_ORIENTATION, 0, h)
+            time = e.getHistoricalEventTime(h)
+        }
+        return StrokePoint((x - tx) / scale, (y - ty) / scale, p, t, o, time - strokeStart)
+    }
+
+    private fun beginStroke(e: MotionEvent) {
+        activePen = pen; activeColor = penColor; activeWidth = penWidth
+        strokeStart = e.eventTime
+        val first = point(e, -1)
+        live = mutableListOf(first)
+        renderer.renderFrontBufferedLayer(Segment(first, first))
+    }
+
+    private fun extendStroke(e: MotionEvent) {
+        if (live == null) return
+        for (h in 0 until e.historySize) addPoint(point(e, h))
+        addPoint(point(e, -1))
+    }
+
+    private fun addPoint(p: StrokePoint) {
+        val pts = live ?: return
+        val prev = pts.last()
+        pts.add(p)
+        renderer.renderFrontBufferedLayer(Segment(prev, p))
+    }
+
+    private fun finish() {
+        if (erased.isNotEmpty()) {
+            editListener?.onEdit(EditAction.Remove(erased.toList()))
+            erased.clear()
+        }
+        val pts = live ?: return
+        live = null
+        val finalPts =
+            if (activePen.isHighlighter && straightHighlighter && pts.size > 1) listOf(pts.first(), pts.last())
+            else pts.toList()
+        val stroke = Stroke(UUID.randomUUID().toString(), activePen, activeColor, activeWidth, finalPts)
+        strokes = strokes + stroke                      // setter commits front -> multi buffer
+        editListener?.onEdit(EditAction.Add(listOf(stroke)))
+    }
+
+    private fun cancelStroke() {
+        live = null
+        renderer.cancel()
+    }
+
+    // ------------------------------------------------------------------ eraser (stroke eraser; area eraser = Phase 2)
+    private fun eraseAt(e: MotionEvent) {
+        val r = 14f * resources.displayMetrics.density / scale
+        val xs = FloatArray(e.historySize + 1) { i -> if (i < e.historySize) e.getHistoricalX(i) else e.x }
+        val ys = FloatArray(e.historySize + 1) { i -> if (i < e.historySize) e.getHistoricalY(i) else e.y }
+        val hits = HashSet<String>()
+        for (i in xs.indices) {
+            val px = (xs[i] - tx) / scale
+            val py = (ys[i] - ty) / scale
+            for (s in strokes) {
+                if (eraseHighlighterOnly && !s.pen.isHighlighter) continue
+                if (touches(s, px, py, r)) hits.add(s.id)
+            }
+        }
+        if (hits.isEmpty()) return
+        erased += strokes.filter { it.id in hits }
+        strokes = strokes.filterNot { it.id in hits }
+    }
+
+    private fun touches(s: Stroke, x: Float, y: Float, r: Float): Boolean {
+        val p = s.points
+        if (p.size == 1) return hypot(p[0].x - x, p[0].y - y) <= r
+        for (i in 1 until p.size) if (segDist(p[i - 1], p[i], x, y) <= r) return true
+        return false
+    }
+
+    private fun segDist(a: StrokePoint, b: StrokePoint, x: Float, y: Float): Float {
+        val dx = b.x - a.x; val dy = b.y - a.y
+        val len2 = dx * dx + dy * dy
+        val t = if (len2 == 0f) 0f else (((x - a.x) * dx + (y - a.y) * dy) / len2).coerceIn(0f, 1f)
+        return hypot(x - (a.x + t * dx), y - (a.y + t * dy))
+    }
+
+    // ------------------------------------------------------------------ finger pan / pinch
+    private fun handleGesture(e: MotionEvent): Boolean {
+        scaleDetector.onTouchEvent(e)
+        when (e.actionMasked) {
+            MotionEvent.ACTION_DOWN, MotionEvent.ACTION_POINTER_DOWN -> { focal(e, -1); lastFx = fx; lastFy = fy }
+            MotionEvent.ACTION_POINTER_UP -> { focal(e, e.actionIndex); lastFx = fx; lastFy = fy }
+            MotionEvent.ACTION_MOVE -> {
+                focal(e, -1)
+                tx += fx - lastFx; ty += fy - lastFy
+                lastFx = fx; lastFy = fy
+                notifyViewport()
+            }
+        }
+        return true
+    }
+
+    private fun focal(e: MotionEvent, skip: Int) {
+        var x = 0f; var y = 0f; var n = 0
+        for (i in 0 until e.pointerCount) { if (i == skip) continue; x += e.getX(i); y += e.getY(i); n++ }
+        if (n > 0) { fx = x / n; fy = y / n }
+    }
+
+    private fun notifyViewport() {
+        renderer.commit()
+        viewportListener?.invoke(scale, tx, ty)
+    }
+}

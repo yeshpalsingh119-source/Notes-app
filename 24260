@@ -1,0 +1,77 @@
+package com.example.inknotes.ink
+
+import android.graphics.Canvas
+import android.graphics.Color
+import android.graphics.Paint
+import android.graphics.Path
+import android.graphics.PorterDuff
+import android.graphics.PorterDuffXfermode
+import com.example.inknotes.domain.model.PenType
+import com.example.inknotes.domain.model.Stroke
+import com.example.inknotes.domain.model.StrokePoint
+import kotlin.math.PI
+import kotlin.math.abs
+import kotlin.math.atan2
+import kotlin.math.sin
+
+/**
+ * Draws strokes in page space. Not thread-safe: use one instance per render thread.
+ * multiplyHighlighters = true for export/flatten (real Multiply against the page); the live
+ * overlay surface is transparent, so it approximates with alpha.
+ */
+class StrokeRenderer(private val multiplyHighlighters: Boolean) {
+    private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+        style = Paint.Style.STROKE
+        strokeJoin = Paint.Join.ROUND
+    }
+    private val multiply = PorterDuffXfermode(PorterDuff.Mode.MULTIPLY)
+    private val path = Path()
+
+    fun draw(c: Canvas, s: Stroke) {
+        val p = s.points
+        if (p.isEmpty()) return
+        val spec = PenSpecs.of(s.pen)
+        if (spec.asPath) {
+            configure(s.colorArgb, spec.alpha, s.width * spec.maxW, spec, s.pen)
+            path.rewind()
+            path.moveTo(p[0].x, p[0].y)
+            if (p.size == 1) path.lineTo(p[0].x + 0.01f, p[0].y)
+            for (i in 1 until p.size) {
+                val a = p[i - 1]; val b = p[i]
+                path.quadTo(a.x, a.y, (a.x + b.x) / 2f, (a.y + b.y) / 2f)
+            }
+            path.lineTo(p.last().x, p.last().y)
+            c.drawPath(path, paint)
+            return
+        }
+        if (p.size == 1) segment(c, p[0], p[0], s.pen, s.colorArgb, s.width)
+        for (i in 1 until p.size) segment(c, p[i - 1], p[i], s.pen, s.colorArgb, s.width)
+    }
+
+    /** One segment between two samples: width/opacity vary with pressure, tilt and direction. */
+    fun segment(c: Canvas, a: StrokePoint, b: StrokePoint, pen: PenType, color: Int, base: Float) {
+        val spec = PenSpecs.of(pen)
+        val pressure = ((a.pressure + b.pressure) / 2f).coerceIn(0f, 1f)
+        var w = base * (spec.minW + (spec.maxW - spec.minW) * pressure)
+        var alpha = spec.alpha
+        if (spec.tiltShading) {
+            val t = (((a.tilt + b.tilt) / 2f) / (PI / 2).toFloat()).coerceIn(0f, 1f)
+            w *= 1f + 2f * t
+            alpha *= 1f - 0.45f * t
+        }
+        spec.nibAngleDeg?.let { nib ->
+            val dir = atan2(b.y - a.y, b.x - a.x)
+            w *= 0.25f + 0.75f * abs(sin(dir - Math.toRadians(nib.toDouble()))).toFloat()
+        }
+        configure(color, alpha, w.coerceAtLeast(0.5f), spec, pen)
+        c.drawLine(a.x, a.y, b.x, b.y, paint)
+    }
+
+    private fun configure(color: Int, alpha: Float, width: Float, spec: PenSpec, pen: PenType) {
+        paint.color = color
+        paint.alpha = (Color.alpha(color) * alpha).toInt().coerceIn(0, 255)
+        paint.strokeWidth = width
+        paint.strokeCap = spec.cap
+        paint.xfermode = if (pen.isHighlighter && multiplyHighlighters) multiply else null
+    }
+}

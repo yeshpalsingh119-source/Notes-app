@@ -1,0 +1,133 @@
+package com.example.inknotes.ui.editor
+
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.CheckBox
+import androidx.compose.material.icons.filled.CheckBoxOutlineBlank
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.Icon
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.key
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.onPreviewKeyEvent
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.example.inknotes.domain.model.BlockKind
+import com.example.inknotes.domain.model.TextBlock
+
+/**
+ * Rich-text layer (sits under the ink layer). editable = true only in TEXT mode; in DRAW mode it is
+ * display-only and has no pointer handlers, so every touch falls through to the ink view.
+ */
+@Composable
+fun RichTextLayer(
+    blocks: List<TextBlock>,
+    editable: Boolean,
+    pendingFocus: String?,
+    textColor: Color,
+    onFocus: (String) -> Unit,
+    onPendingFocusConsumed: () -> Unit,
+    onChange: (TextBlock) -> Unit,
+    onSplit: (id: String, before: String, after: String) -> Unit,
+    onBackspaceEmpty: (String) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Column(modifier.width(720.dp).padding(horizontal = 24.dp, vertical = 16.dp)) {
+        blocks.forEach { b ->
+            key(b.id) {
+                BlockRow(b, editable, pendingFocus, textColor, onFocus, onPendingFocusConsumed, onChange, onSplit, onBackspaceEmpty)
+            }
+        }
+    }
+}
+
+@Composable
+private fun BlockRow(
+    b: TextBlock, editable: Boolean, pendingFocus: String?, textColor: Color,
+    onFocus: (String) -> Unit, onPendingFocusConsumed: () -> Unit,
+    onChange: (TextBlock) -> Unit,
+    onSplit: (String, String, String) -> Unit,
+    onBackspaceEmpty: (String) -> Unit
+) {
+    val focus = remember { FocusRequester() }
+    LaunchedEffect(pendingFocus) {
+        if (pendingFocus == b.id && editable) {
+            runCatching { focus.requestFocus() }
+            onPendingFocusConsumed()
+        }
+    }
+
+    val base = if (b.colorArgb != 0) Color(b.colorArgb) else textColor
+    val done = b.kind == BlockKind.CHECKLIST && b.checked
+    val decorations = buildList {
+        if (b.underline) add(TextDecoration.Underline)
+        if (b.strike || done) add(TextDecoration.LineThrough)
+    }
+    val style = TextStyle(
+        color = base.copy(alpha = if (done) 0.5f else 1f),
+        fontSize = b.sizeSp.sp,
+        fontWeight = if (b.bold) FontWeight.Bold else FontWeight.Normal,
+        fontStyle = if (b.italic) FontStyle.Italic else FontStyle.Normal,
+        textDecoration = if (decorations.isEmpty()) TextDecoration.None else TextDecoration.combine(decorations),
+        textAlign = when (b.align) { 1 -> TextAlign.Center; 2 -> TextAlign.End; else -> TextAlign.Start },
+        background = if (b.highlightArgb != 0) Color(b.highlightArgb).copy(alpha = 0.5f) else Color.Unspecified
+    )
+
+    Row(
+        Modifier.fillMaxWidth().padding(start = (b.indent * 24).dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        when (b.kind) {
+            BlockKind.BULLET -> Text("•", modifier = Modifier.padding(end = 10.dp), style = style.copy(textDecoration = TextDecoration.None, background = Color.Unspecified))
+            BlockKind.CHECKLIST ->
+                if (editable) Checkbox(checked = b.checked, onCheckedChange = { onChange(b.copy(checked = it)) })
+                else Icon(
+                    if (b.checked) Icons.Default.CheckBox else Icons.Default.CheckBoxOutlineBlank,
+                    contentDescription = null, tint = base, modifier = Modifier.padding(end = 8.dp)
+                )
+            BlockKind.PARAGRAPH -> Unit
+        }
+        if (editable) {
+            BasicTextField(
+                value = b.text,
+                onValueChange = { v ->
+                    val nl = v.indexOf('\n')
+                    if (nl >= 0) onSplit(b.id, v.substring(0, nl), v.substring(nl + 1).replace("\n", ""))
+                    else onChange(b.copy(text = v))
+                },
+                textStyle = style,
+                cursorBrush = SolidColor(base),
+                modifier = Modifier
+                    .weight(1f)
+                    .focusRequester(focus)
+                    .onFocusChanged { if (it.isFocused) onFocus(b.id) }
+                    .onPreviewKeyEvent { e ->
+                        if (e.type == KeyEventType.KeyDown && e.key == Key.Backspace && b.text.isEmpty()) {
+                            onBackspaceEmpty(b.id); true
+                        } else false
+                    }
+            )
+        } else {
+            Text(b.text, modifier = Modifier.weight(1f), style = style)
+        }
+    }
+}

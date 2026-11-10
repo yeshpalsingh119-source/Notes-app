@@ -1,0 +1,60 @@
+package com.example.inknotes.data.repository
+
+import android.content.Context
+import com.example.inknotes.domain.model.Stroke
+import dagger.hilt.android.qualifiers.ApplicationContext
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
+import java.io.File
+import javax.inject.Inject
+import javax.inject.Singleton
+
+/**
+ * Strokes live on the file system, not in SQLite: filesDir/strokes/<pageId>/chunk_<n>.json,
+ * CHUNK strokes per file. Strokes are immutable, so a chunk whose stroke-id list is unchanged
+ * is skipped on save (cheap incremental auto-save).
+ */
+@Singleton
+class StrokeFileStore @Inject constructor(@ApplicationContext ctx: Context) {
+    private val root = File(ctx.filesDir, "strokes")
+    private val json = Json { ignoreUnknownKeys = true }
+    private val ser = ListSerializer(Stroke.serializer())
+    private val savedSig = HashMap<Long, HashMap<Int, Int>>()   // pageId -> chunk -> id-list hash
+
+    suspend fun load(pageId: Long): List<Stroke> = withContext(Dispatchers.IO) {
+        val dir = File(root, "$pageId")
+        dir.listFiles { f -> f.name.startsWith("chunk_") && f.name.endsWith(".json") }
+            .orEmpty()
+            .sortedBy { index(it) }
+            .flatMap { f -> runCatching { json.decodeFromString(ser, f.readText()) }.getOrDefault(emptyList()) }
+    }
+
+    suspend fun save(pageId: Long, strokes: List<Stroke>) = withContext(Dispatchers.IO) {
+        val dir = File(root, "$pageId").also { it.mkdirs() }
+        val sigs = savedSig.getOrPut(pageId) { HashMap() }
+        val chunks = strokes.chunked(CHUNK)
+        chunks.forEachIndexed { i, chunk ->
+            val sig = chunk.map { it.id }.hashCode()
+            if (sigs[i] == sig) return@forEachIndexed
+            val tmp = File(dir, "chunk_$i.tmp")
+            tmp.writeText(json.encodeToString(ser, chunk))
+            tmp.renameTo(File(dir, "chunk_$i.json"))      // atomic replace
+            sigs[i] = sig
+        }
+        dir.listFiles { f -> f.name.endsWith(".json") }.orEmpty()
+            .filter { index(it) >= chunks.size }
+            .forEach { it.delete() }
+        sigs.keys.removeAll { it >= chunks.size }
+    }
+
+    suspend fun delete(pageId: Long) = withContext(Dispatchers.IO) {
+        File(root, "$pageId").deleteRecursively()
+        savedSig.remove(pageId)
+    }
+
+    private fun index(f: File) = f.name.removePrefix("chunk_").substringBefore('.').toIntOrNull() ?: Int.MAX_VALUE
+
+    private companion object { const val CHUNK = 200 }
+}

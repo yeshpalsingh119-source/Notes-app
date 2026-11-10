@@ -1,0 +1,192 @@
+package com.example.inknotes.ui.editor
+
+import androidx.lifecycle.SavedStateHandle
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import com.example.inknotes.data.repository.NotesRepository
+import com.example.inknotes.domain.UndoRedoStack
+import com.example.inknotes.domain.model.*
+import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import kotlinx.serialization.builtins.ListSerializer
+import kotlinx.serialization.json.Json
+import javax.inject.Inject
+
+enum class EditorMode { DRAW, TEXT }
+
+data class PenState(
+    val tool: Tool = Tool.PEN,
+    val pen: PenType = PenType.FOUNTAIN,
+    val color: Int = 0xFF000000.toInt(),
+    val width: Float = 3f,
+    val fingerDrawing: Boolean = false,
+    val straightHighlighter: Boolean = false,
+    val eraseHighlighterOnly: Boolean = false
+)
+
+data class HistoryState(val canUndo: Boolean = false, val canRedo: Boolean = false)
+
+@HiltViewModel
+class EditorViewModel @Inject constructor(
+    private val repo: NotesRepository,
+    state: SavedStateHandle
+) : ViewModel() {
+
+    private val noteId: Long = checkNotNull(state.get<Long>("noteId"))
+    private var pageId: Long = -1
+    private val undoStack = UndoRedoStack()
+    private val json = Json { ignoreUnknownKeys = true }
+    private val blockSer = ListSerializer(TextBlock.serializer())
+
+    // ---------------- ink ----------------
+    private val _strokes = MutableStateFlow<List<Stroke>>(emptyList())
+    val strokes: StateFlow<List<Stroke>> = _strokes.asStateFlow()
+
+    private val _pen = MutableStateFlow(PenState())
+    val pen: StateFlow<PenState> = _pen.asStateFlow()
+
+    private val _history = MutableStateFlow(HistoryState())
+    val history: StateFlow<HistoryState> = _history.asStateFlow()
+
+    // ---------------- page ----------------
+    private val _template = MutableStateFlow(PageTemplate.BLANK)
+    val template: StateFlow<PageTemplate> = _template.asStateFlow()
+
+    private val _title = MutableStateFlow("")
+    val title: StateFlow<String> = _title.asStateFlow()
+
+    private val _mode = MutableStateFlow(EditorMode.DRAW)
+    val mode: StateFlow<EditorMode> = _mode.asStateFlow()
+
+    // ---------------- rich text (block based) ----------------
+    private val _blocks = MutableStateFlow(listOf(TextBlock()))
+    val blocks: StateFlow<List<TextBlock>> = _blocks.asStateFlow()
+
+    private val _focusedId = MutableStateFlow<String?>(null)
+    val focusedId: StateFlow<String?> = _focusedId.asStateFlow()
+
+    private val _pendingFocus = MutableStateFlow<String?>(null)
+    val pendingFocus: StateFlow<String?> = _pendingFocus.asStateFlow()
+
+    /** CONFLATED: a burst of edits collapses into one save, but every change is saved right away. */
+    private val saveRequests = Channel<Unit>(Channel.CONFLATED)
+    private val textSaves = Channel<Unit>(Channel.CONFLATED)
+
+    init {
+        viewModelScope.launch {
+            repo.markOpened(noteId)
+            _title.value = repo.title(noteId)
+            val page = repo.firstPage(noteId)
+            pageId = page.id
+            _template.value = runCatching { PageTemplate.valueOf(page.template) }.getOrDefault(PageTemplate.BLANK)
+            _strokes.value = repo.loadStrokes(pageId)
+            if (page.richTextJson.isNotBlank()) {
+                runCatching { json.decodeFromString(blockSer, page.richTextJson) }
+                    .getOrNull()?.takeIf { it.isNotEmpty() }?.let { _blocks.value = it }
+            }
+            launch {
+                for (r in textSaves) {
+                    val b = _blocks.value
+                    val encoded = withContext(Dispatchers.Default) { json.encodeToString(blockSer, b) }
+                    repo.saveRichText(noteId, pageId, encoded, b.joinToString("\n") { it.text })
+                }
+            }
+            for (r in saveRequests) repo.saveStrokes(noteId, pageId, _strokes.value)
+        }
+    }
+
+    // ---------------- ink edits ----------------
+    fun onEdit(a: EditAction) {
+        undoStack.push(a)
+        apply(a, reverse = false)
+        afterChange()
+    }
+
+    fun undo() { undoStack.undo()?.let { apply(it, reverse = true); afterChange() } }
+    fun redo() { undoStack.redo()?.let { apply(it, reverse = false); afterChange() } }
+
+    private fun apply(a: EditAction, reverse: Boolean) {
+        val add = (a is EditAction.Add) != reverse
+        val ids = a.strokes.map { it.id }.toSet()
+        _strokes.update { cur ->
+            if (add) { if (cur.any { it.id in ids }) cur else cur + a.strokes } else cur.filterNot { it.id in ids }
+        }
+    }
+
+    private fun afterChange() {
+        _history.value = HistoryState(undoStack.canUndo, undoStack.canRedo)
+        saveRequests.trySend(Unit)
+    }
+
+    fun updatePen(block: (PenState) -> PenState) = _pen.update(block)
+
+    fun setMode(m: EditorMode) { _mode.value = m }
+
+    fun setTemplate(t: PageTemplate) {
+        _template.value = t
+        viewModelScope.launch { if (pageId > 0) repo.setTemplate(pageId, t) }
+    }
+
+    fun setTitle(t: String) {
+        _title.value = t
+        viewModelScope.launch { repo.setTitle(noteId, t) }
+    }
+
+    // ---------------- text block edits ----------------
+    fun focusBlock(id: String) { _focusedId.value = id }
+    fun pendingFocusConsumed() { _pendingFocus.value = null }
+
+    fun changeBlock(b: TextBlock) {
+        _blocks.value = _blocks.value.map { if (it.id == b.id) b else it }
+        textSaves.trySend(Unit)
+    }
+
+    /** Enter pressed inside block [id]: text before the newline stays, text after moves to a new block. */
+    fun splitBlock(id: String, before: String, after: String) {
+        val l = _blocks.value
+        val i = l.indexOfFirst { it.id == id }
+        if (i < 0) return
+        val cur = l[i]
+        val out = l.toMutableList()
+        if (cur.kind != BlockKind.PARAGRAPH && before.isEmpty() && after.isEmpty()) {
+            out[i] = cur.copy(kind = BlockKind.PARAGRAPH, checked = false)     // Enter on empty list line leaves the list
+        } else {
+            val next = cur.copy(id = newBlockId(), text = after, checked = false)
+            out[i] = cur.copy(text = before)
+            out.add(i + 1, next)
+            _pendingFocus.value = next.id
+        }
+        _blocks.value = out
+        textSaves.trySend(Unit)
+    }
+
+    /** Backspace on an empty block: list line -> plain paragraph, plain paragraph -> removed. */
+    fun backspaceEmpty(id: String) {
+        val l = _blocks.value
+        val i = l.indexOfFirst { it.id == id }
+        if (i < 0) return
+        val cur = l[i]
+        if (cur.kind != BlockKind.PARAGRAPH) {
+            _blocks.value = l.toMutableList().also { it[i] = cur.copy(kind = BlockKind.PARAGRAPH, checked = false) }
+        } else if (l.size > 1) {
+            val rest = l.filterIndexed { idx, _ -> idx != i }
+            _blocks.value = rest
+            _pendingFocus.value = rest[(i - 1).coerceAtLeast(0)].id
+        }
+        textSaves.trySend(Unit)
+    }
+
+    /** Applies a format change to the focused block (or the last block if none is focused). */
+    fun format(t: (TextBlock) -> TextBlock) {
+        val l = _blocks.value
+        val target = l.firstOrNull { it.id == _focusedId.value } ?: l.last()
+        changeBlock(t(target))
+    }
+}

@@ -1,0 +1,277 @@
+package com.example.inknotes.ui.editor
+
+import android.graphics.RectF
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.isSystemInDarkTheme
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
+import androidx.compose.material.icons.automirrored.filled.Redo
+import androidx.compose.material.icons.automirrored.filled.Undo
+import androidx.compose.material.icons.filled.Brush
+import androidx.compose.material.icons.filled.GridOn
+import androidx.compose.material.icons.filled.TextFields
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.TransformOrigin
+import androidx.compose.ui.graphics.drawscope.drawIntoCanvas
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
+import androidx.compose.ui.text.font.FontStyle
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.inknotes.domain.model.BlockKind
+import com.example.inknotes.domain.model.PageTemplate
+import com.example.inknotes.domain.model.PenType
+import com.example.inknotes.domain.model.TextBlock
+import com.example.inknotes.domain.model.Tool
+import com.example.inknotes.ink.InkSurfaceView
+import com.example.inknotes.ink.TemplateRenderer
+
+private data class Viewport(val scale: Float = 1f, val tx: Float = 0f, val ty: Float = 0f)
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun EditorScreen(onBack: () -> Unit, vm: EditorViewModel = hiltViewModel()) {
+    val strokes by vm.strokes.collectAsStateWithLifecycle()
+    val pen by vm.pen.collectAsStateWithLifecycle()
+    val history by vm.history.collectAsStateWithLifecycle()
+    val template by vm.template.collectAsStateWithLifecycle()
+    val title by vm.title.collectAsStateWithLifecycle()
+    val mode by vm.mode.collectAsStateWithLifecycle()
+    val blocks by vm.blocks.collectAsStateWithLifecycle()
+    val focusedId by vm.focusedId.collectAsStateWithLifecycle()
+    val pendingFocus by vm.pendingFocus.collectAsStateWithLifecycle()
+
+    val dark = isSystemInDarkTheme()
+    val paper = if (dark) 0xFF2B2B2B.toInt() else Color.White.toArgb()   // dark-mode paper adjust (toggle = later)
+    val lineInk = if (dark) Color.White.toArgb() else Color.Black.toArgb()
+    var viewport by remember { mutableStateOf(Viewport()) }
+    var templateMenu by remember { mutableStateOf(false) }
+    val focusedBlock = blocks.firstOrNull { it.id == focusedId } ?: blocks.last()
+
+    Scaffold(
+        topBar = {
+            TopAppBar(
+                title = {
+                    TextField(
+                        value = title, onValueChange = vm::setTitle, singleLine = true,
+                        placeholder = { Text("Untitled note") },
+                        colors = TextFieldDefaults.colors(
+                            focusedContainerColor = Color.Transparent, unfocusedContainerColor = Color.Transparent,
+                            focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent
+                        )
+                    )
+                },
+                navigationIcon = { IconButton(onBack) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") } },
+                actions = {
+                    // Draw <-> Text mode (stylus draws in DRAW; taps/keyboard edit text in TEXT)
+                    IconButton({ vm.setMode(if (mode == EditorMode.DRAW) EditorMode.TEXT else EditorMode.DRAW) }) {
+                        Icon(
+                            if (mode == EditorMode.DRAW) Icons.Default.TextFields else Icons.Default.Brush,
+                            if (mode == EditorMode.DRAW) "Switch to text mode" else "Switch to draw mode"
+                        )
+                    }
+                    IconButton(vm::undo, enabled = history.canUndo) { Icon(Icons.AutoMirrored.Filled.Undo, "Undo") }
+                    IconButton(vm::redo, enabled = history.canRedo) { Icon(Icons.AutoMirrored.Filled.Redo, "Redo") }
+                    Box {
+                        IconButton({ templateMenu = true }) { Icon(Icons.Default.GridOn, "Page template") }
+                        DropdownMenu(templateMenu, { templateMenu = false }) {
+                            PageTemplate.entries.forEach { t ->
+                                DropdownMenuItem(
+                                    text = { Text(t.name.replace('_', ' ').lowercase().replaceFirstChar { it.uppercase() }) },
+                                    onClick = { vm.setTemplate(t); templateMenu = false }
+                                )
+                            }
+                        }
+                    }
+                }
+            )
+        },
+        bottomBar = {
+            if (mode == EditorMode.DRAW) PenToolbar(pen, vm::updatePen)
+            else TextToolbar(focusedBlock, vm::format)
+        }
+    ) { pad ->
+        Box(Modifier.padding(pad).fillMaxSize().clipToBounds()) {
+            // Layer 1 (Compose): paper + template, follows the ink viewport.
+            Canvas(Modifier.fillMaxSize()) {
+                val (s, tx, ty) = viewport
+                val visible = RectF(-tx / s, -ty / s, (size.width - tx) / s, (size.height - ty) / s)
+                drawIntoCanvas { c ->
+                    val nc = c.nativeCanvas
+                    nc.save(); nc.translate(tx, ty); nc.scale(s, s)
+                    TemplateRenderer.draw(nc, template, visible, paper, lineInk, s)
+                    nc.restore()
+                }
+            }
+            // Layer 3: handwriting (low-latency SurfaceView overlay, always drawn above the window)
+            AndroidView(
+                modifier = Modifier.fillMaxSize(),
+                factory = { ctx ->
+                    InkSurfaceView(ctx).apply {
+                        editListener = InkSurfaceView.EditListener { vm.onEdit(it) }
+                        viewportListener = { s, x, y -> viewport = Viewport(s, x, y) }
+                    }
+                },
+                update = { v ->
+                    v.strokes = strokes
+                    v.tool = pen.tool; v.pen = pen.pen
+                    v.penColor = pen.color; v.penWidth = pen.width
+                    v.fingerDrawing = pen.fingerDrawing
+                    v.straightHighlighter = pen.straightHighlighter
+                    v.eraseHighlighterOnly = pen.eraseHighlighterOnly
+                },
+                onRelease = { it.release() }
+            )
+            // Layer 2 (Compose): rich text. Declared AFTER the ink view so that in TEXT mode it receives the
+            // touches first (visually the SurfaceView still draws on top). In DRAW mode it has no pointer
+            // handlers, so touches fall through to the ink view.
+            RichTextLayer(
+                blocks = blocks,
+                editable = mode == EditorMode.TEXT,
+                pendingFocus = pendingFocus,
+                textColor = if (dark) Color.White else Color.Black,
+                onFocus = vm::focusBlock,
+                onPendingFocusConsumed = vm::pendingFocusConsumed,
+                onChange = vm::changeBlock,
+                onSplit = vm::splitBlock,
+                onBackspaceEmpty = vm::backspaceEmpty,
+                modifier = Modifier.graphicsLayer {
+                    translationX = viewport.tx; translationY = viewport.ty
+                    scaleX = viewport.scale; scaleY = viewport.scale
+                    transformOrigin = TransformOrigin(0f, 0f)
+                }
+            )
+        }
+    }
+}
+
+private val swatches = listOf(0xFF000000, 0xFF1565C0, 0xFFC62828, 0xFF2E7D32, 0xFFF9A825, 0xFF6A1B9A, 0xFFFFFFFF)
+    .map { it.toInt() }
+
+@Composable
+private fun PenToolbar(pen: PenState, update: ((PenState) -> PenState) -> Unit) {
+    Surface(tonalElevation = 3.dp) {
+        Column(Modifier.navigationBarsPadding().padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                PenType.entries.forEach { t ->
+                    FilterChip(
+                        selected = pen.tool == Tool.PEN && pen.pen == t,
+                        onClick = { update { it.copy(tool = Tool.PEN, pen = t) } },
+                        label = { Text(t.label) }
+                    )
+                }
+                FilterChip(
+                    selected = pen.tool == Tool.ERASER,
+                    onClick = { update { it.copy(tool = Tool.ERASER) } },
+                    label = { Text("Eraser") }
+                )
+                FilterChip(
+                    selected = pen.straightHighlighter,
+                    onClick = { update { it.copy(straightHighlighter = !it.straightHighlighter) } },
+                    label = { Text("Straight hl") }
+                )
+                FilterChip(
+                    selected = pen.eraseHighlighterOnly,
+                    onClick = { update { it.copy(eraseHighlighterOnly = !it.eraseHighlighterOnly) } },
+                    label = { Text("Erase hl only") }
+                )
+            }
+            Row(
+                Modifier.horizontalScroll(rememberScrollState()),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                swatches.forEach { c ->
+                    Box(
+                        Modifier.size(32.dp).clip(CircleShape).background(Color(c))
+                            .border(
+                                BorderStroke(if (pen.color == c) 3.dp else 1.dp, MaterialTheme.colorScheme.outline),
+                                CircleShape
+                            )
+                            .clickable { update { it.copy(color = c) } }
+                    )
+                }
+                Slider(
+                    value = pen.width, onValueChange = { w -> update { it.copy(width = w) } },
+                    valueRange = 1f..24f, modifier = Modifier.width(180.dp)
+                )
+                Text("Finger draw")
+                Switch(pen.fingerDrawing, { v -> update { it.copy(fingerDrawing = v) } })
+            }
+        }
+    }
+}
+
+/** Formatting toolbar for the focused text block (shown in TEXT mode, lifts above the keyboard). */
+@Composable
+private fun TextToolbar(b: TextBlock, format: ((TextBlock) -> TextBlock) -> Unit) {
+    Surface(tonalElevation = 3.dp) {
+        Column(Modifier.navigationBarsPadding().imePadding().padding(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FilterChip(b.bold, { format { it.copy(bold = !it.bold) } }, { Text("B", fontWeight = FontWeight.Bold) })
+                FilterChip(b.italic, { format { it.copy(italic = !it.italic) } }, { Text("I", fontStyle = FontStyle.Italic) })
+                FilterChip(b.underline, { format { it.copy(underline = !it.underline) } }, { Text("U", textDecoration = TextDecoration.Underline) })
+                FilterChip(b.strike, { format { it.copy(strike = !it.strike) } }, { Text("S", textDecoration = TextDecoration.LineThrough) })
+                FilterChip(
+                    b.kind == BlockKind.BULLET,
+                    { format { it.copy(kind = if (it.kind == BlockKind.BULLET) BlockKind.PARAGRAPH else BlockKind.BULLET, checked = false) } },
+                    { Text("• List") }
+                )
+                FilterChip(
+                    b.kind == BlockKind.CHECKLIST,
+                    { format { it.copy(kind = if (it.kind == BlockKind.CHECKLIST) BlockKind.PARAGRAPH else BlockKind.CHECKLIST, checked = false) } },
+                    { Text("Checklist") }
+                )
+                AssistChip({ format { it.copy(sizeSp = (it.sizeSp - 2).coerceAtLeast(12)) } }, { Text("A-") })
+                AssistChip({ format { it.copy(sizeSp = (it.sizeSp + 2).coerceAtMost(48)) } }, { Text("A+") })
+                AssistChip(
+                    { format { it.copy(align = (it.align + 1) % 3) } },
+                    { Text(when (b.align) { 1 -> "Center"; 2 -> "Right"; else -> "Left" }) }
+                )
+                AssistChip({ format { it.copy(indent = (it.indent - 1).coerceAtLeast(0)) } }, { Text("<-") })
+                AssistChip({ format { it.copy(indent = (it.indent + 1).coerceAtMost(6)) } }, { Text("->") })
+                FilterChip(
+                    b.highlightArgb != 0,
+                    { format { it.copy(highlightArgb = if (it.highlightArgb == 0) 0xFFFFEB3B.toInt() else 0) } },
+                    { Text("Highlight") }
+                )
+            }
+            Row(Modifier.horizontalScroll(rememberScrollState()), horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                Box(
+                    Modifier.size(32.dp).clip(CircleShape)
+                        .border(BorderStroke(if (b.colorArgb == 0) 3.dp else 1.dp, MaterialTheme.colorScheme.outline), CircleShape)
+                        .clickable { format { it.copy(colorArgb = 0) } }
+                )
+                swatches.forEach { c ->
+                    Box(
+                        Modifier.size(32.dp).clip(CircleShape).background(Color(c))
+                            .border(
+                                BorderStroke(if (b.colorArgb == c) 3.dp else 1.dp, MaterialTheme.colorScheme.outline),
+                                CircleShape
+                            )
+                            .clickable { format { it.copy(colorArgb = c) } }
+                    )
+                }
+            }
+        }
+    }
+}

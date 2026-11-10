@@ -1,0 +1,285 @@
+package com.example.inknotes.ui.home
+
+import android.text.format.DateUtils
+import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.background
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.filled.ViewList
+import androidx.compose.material.icons.filled.*
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.hilt.navigation.compose.hiltViewModel
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import com.example.inknotes.data.db.NoteEntity
+import kotlinx.coroutines.launch
+
+private val folderColors = listOf(0xFFE53935, 0xFFFB8C00, 0xFFFDD835, 0xFF43A047, 0xFF1E88E5, 0xFF8E24AA).map { it.toInt() }
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun HomeScreen(onOpenNote: (Long) -> Unit, vm: HomeViewModel = hiltViewModel()) {
+    val notes by vm.notes.collectAsStateWithLifecycle()
+    val folders by vm.folders.collectAsStateWithLifecycle()
+    val dest by vm.destination.collectAsStateWithLifecycle()
+    val mode by vm.viewMode.collectAsStateWithLifecycle()
+    val query by vm.query.collectAsStateWithLifecycle()
+
+    val wide = LocalConfiguration.current.screenWidthDp >= 840      // tablet landscape -> permanent drawer
+    val drawerState = rememberDrawerState(DrawerValue.Closed)
+    val scope = rememberCoroutineScope()
+    var showNewFolder by remember { mutableStateOf(false) }
+
+    val drawer: @Composable () -> Unit = {
+        DrawerBody(
+            selected = dest, folders = folders,
+            onSelect = { vm.select(it); scope.launch { drawerState.close() } },
+            onNewFolder = { showNewFolder = true }
+        )
+    }
+    val content: @Composable () -> Unit = {
+        HomeContent(
+            title = titleFor(dest, folders), wide = wide, notes = notes, mode = mode, query = query,
+            trash = dest == Destination.Trash,
+            onMenu = { scope.launch { drawerState.open() } },
+            onQuery = vm::setQuery, onMode = vm::setViewMode,
+            onOpen = onOpenNote, onNew = { vm.newNote(onOpenNote) },
+            onPin = vm::togglePin, onTrash = vm::trash, onRestore = vm::restore
+        )
+    }
+
+    if (wide) {
+        PermanentNavigationDrawer(
+            drawerContent = { PermanentDrawerSheet(Modifier.width(300.dp)) { drawer() } },
+            content = content
+        )
+    } else {
+        ModalNavigationDrawer(
+            drawerContent = { ModalDrawerSheet { drawer() } },
+            drawerState = drawerState,
+            content = content
+        )
+    }
+
+    if (showNewFolder) {
+        NewFolderDialog(
+            onDismiss = { showNewFolder = false },
+            onCreate = { name -> vm.newFolder(name, folderColors[folders.size % folderColors.size]); showNewFolder = false }
+        )
+    }
+}
+
+private fun titleFor(d: Destination, folders: List<FolderRow>) = when (d) {
+    Destination.All -> "All notes"
+    Destination.Frequent -> "Frequently used"
+    Destination.Locked -> "Locked notes"
+    Destination.Trash -> "Trash"
+    is Destination.Folder -> folders.firstOrNull { it.id == d.id }?.name ?: "Folder"
+}
+
+// ------------------------------------------------------------------ content
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun HomeContent(
+    title: String, wide: Boolean, notes: List<NoteEntity>, mode: ViewMode, query: String, trash: Boolean,
+    onMenu: () -> Unit, onQuery: (String) -> Unit, onMode: (ViewMode) -> Unit,
+    onOpen: (Long) -> Unit, onNew: () -> Unit,
+    onPin: (NoteEntity) -> Unit, onTrash: (Long) -> Unit, onRestore: (Long) -> Unit
+) {
+    // One UI style: big header that collapses to a compact toolbar while scrolling
+    val scroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior()
+    var modeMenu by remember { mutableStateOf(false) }
+
+    Scaffold(
+        modifier = Modifier.nestedScroll(scroll.nestedScrollConnection),
+        topBar = {
+            LargeTopAppBar(
+                title = { Text(title) },
+                navigationIcon = {
+                    if (!wide) IconButton(onMenu) { Icon(Icons.Default.Menu, "Menu") }
+                },
+                actions = {
+                    Box {
+                        IconButton({ modeMenu = true }) {
+                            Icon(
+                                if (mode.minCell != null) Icons.Default.ViewModule else Icons.AutoMirrored.Filled.ViewList,
+                                "View mode"
+                            )
+                        }
+                        DropdownMenu(modeMenu, { modeMenu = false }) {
+                            ViewMode.entries.forEach { m ->
+                                DropdownMenuItem(text = { Text(m.label) }, onClick = { onMode(m); modeMenu = false })
+                            }
+                        }
+                    }
+                },
+                scrollBehavior = scroll
+            )
+        },
+        floatingActionButton = {
+            if (!trash) ExtendedFloatingActionButton(onClick = onNew, icon = { Icon(Icons.Default.Add, null) }, text = { Text("New note") })
+        }
+    ) { pad ->
+        LazyVerticalGrid(
+            columns = mode.minCell?.let { GridCells.Adaptive(it) } ?: GridCells.Fixed(1),
+            modifier = Modifier.padding(pad).fillMaxSize(),
+            contentPadding = PaddingValues(16.dp),
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            item(span = { GridItemSpan(maxLineSpan) }) {
+                TextField(
+                    value = query, onValueChange = onQuery, singleLine = true,
+                    placeholder = { Text("Search title, text, handwriting, tags") },
+                    leadingIcon = { Icon(Icons.Default.Search, null) },
+                    shape = RoundedCornerShape(50),
+                    colors = TextFieldDefaults.colors(focusedIndicatorColor = Color.Transparent, unfocusedIndicatorColor = Color.Transparent),
+                    modifier = Modifier.fillMaxWidth()
+                )
+            }
+            items(notes, key = { it.id }) { n ->
+                NoteItem(n, mode, trash, { onOpen(n.id) }, { onPin(n) }, { onTrash(n.id) }, { onRestore(n.id) })
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalFoundationApi::class)
+@Composable
+private fun NoteItem(
+    n: NoteEntity, mode: ViewMode, trash: Boolean,
+    onOpen: () -> Unit, onPin: () -> Unit, onTrash: () -> Unit, onRestore: () -> Unit
+) {
+    var menu by remember { mutableStateOf(false) }
+    val whenText = remember(n.updatedAt) { DateUtils.getRelativeTimeSpanString(n.updatedAt).toString() }
+    val titleText = n.title.ifBlank { "Untitled note" }
+
+    Box {
+        Card(Modifier.fillMaxWidth().combinedClickable(onClick = onOpen, onLongClick = { menu = true })) {
+            when (mode) {
+                ViewMode.SIMPLE_LIST -> Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(titleText, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    if (n.isPinned) Icon(Icons.Default.PushPin, "Pinned", Modifier.size(16.dp))
+                    Spacer(Modifier.width(8.dp))
+                    Text(whenText, style = MaterialTheme.typography.labelSmall)
+                }
+                ViewMode.LIST -> Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                    PreviewBox(n, Modifier.size(64.dp))
+                    Spacer(Modifier.width(12.dp))
+                    Column(Modifier.weight(1f)) {
+                        Text(titleText, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleMedium)
+                        Text(whenText, style = MaterialTheme.typography.labelSmall)
+                    }
+                    if (n.isPinned) Icon(Icons.Default.PushPin, "Pinned", Modifier.size(16.dp))
+                }
+                else -> Column {
+                    PreviewBox(n, Modifier.fillMaxWidth().aspectRatio(0.8f))
+                    Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
+                        Column(Modifier.weight(1f)) {
+                            Text(titleText, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.titleSmall)
+                            Text(whenText, style = MaterialTheme.typography.labelSmall)
+                        }
+                        if (n.isPinned) Icon(Icons.Default.PushPin, "Pinned", Modifier.size(16.dp))
+                    }
+                }
+            }
+        }
+        DropdownMenu(menu, { menu = false }) {
+            if (trash) {
+                DropdownMenuItem(text = { Text("Restore") }, onClick = { onRestore(); menu = false })
+            } else {
+                DropdownMenuItem(text = { Text(if (n.isPinned) "Unpin" else "Pin to top") }, onClick = { onPin(); menu = false })
+                DropdownMenuItem(text = { Text("Move to trash") }, onClick = { onTrash(); menu = false })
+            }
+        }
+    }
+}
+
+/** Page thumbnail placeholder (real previews = Phase 2). Locked notes never show a preview. */
+@Composable
+private fun PreviewBox(n: NoteEntity, modifier: Modifier) {
+    Box(
+        modifier.background(MaterialTheme.colorScheme.surfaceVariant, RoundedCornerShape(16.dp)),
+        contentAlignment = Alignment.Center
+    ) {
+        if (n.isLocked) Icon(Icons.Default.Lock, "Locked")
+    }
+}
+
+// ------------------------------------------------------------------ drawer
+@Composable
+private fun DrawerBody(
+    selected: Destination, folders: List<FolderRow>,
+    onSelect: (Destination) -> Unit, onNewFolder: () -> Unit
+) {
+    LazyColumn(Modifier.padding(horizontal = 12.dp)) {
+        item { Text("InkNotes", style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(20.dp)) }
+        item { DrawerItem("All notes", Icons.Default.Description, selected == Destination.All) { onSelect(Destination.All) } }
+        item { DrawerItem("Frequently used", Icons.Default.StarBorder, selected == Destination.Frequent) { onSelect(Destination.Frequent) } }
+        item { DrawerItem("Shared notebooks", Icons.Default.People, false, soon = true) {} }
+        item { DrawerItem("Voice recordings", Icons.Default.Mic, false, soon = true) {} }
+        item { DrawerItem("Locked notes", Icons.Default.Lock, selected == Destination.Locked) { onSelect(Destination.Locked) } }
+        item { DrawerItem("Trash (30 days)", Icons.Default.Delete, selected == Destination.Trash) { onSelect(Destination.Trash) } }
+
+        item { SectionLabel("Folders") }
+        items(folders, key = { "f${it.id}" }) { f ->
+            NavigationDrawerItem(
+                label = { Text(f.name, maxLines = 1, overflow = TextOverflow.Ellipsis) },
+                badge = { Text("${f.totalCount}") },
+                icon = { Icon(Icons.Default.Folder, null, tint = Color(f.colorArgb)) },
+                selected = selected == Destination.Folder(f.id),
+                onClick = { onSelect(Destination.Folder(f.id)) },
+                modifier = Modifier.padding(start = (f.depth * 16).dp)
+            )
+        }
+        item { TextButton(onNewFolder) { Icon(Icons.Default.Add, null); Spacer(Modifier.width(8.dp)); Text("New folder") } }
+
+        item { SectionLabel("Tags") }
+        item { Text("Coming soon", Modifier.padding(horizontal = 16.dp).alpha(0.6f), style = MaterialTheme.typography.bodySmall) }
+    }
+}
+
+@Composable
+private fun DrawerItem(
+    label: String, icon: androidx.compose.ui.graphics.vector.ImageVector,
+    selected: Boolean, soon: Boolean = false, onClick: () -> Unit
+) {
+    NavigationDrawerItem(
+        label = { Text(if (soon) "$label (soon)" else label) },
+        icon = { Icon(icon, null) },
+        selected = selected, onClick = onClick,
+        modifier = Modifier.alpha(if (soon) 0.5f else 1f)
+    )
+}
+
+@Composable
+private fun SectionLabel(text: String) =
+    Text(text, Modifier.padding(start = 16.dp, top = 16.dp, bottom = 4.dp), style = MaterialTheme.typography.titleSmall)
+
+@Composable
+private fun NewFolderDialog(onDismiss: () -> Unit, onCreate: (String) -> Unit) {
+    var name by remember { mutableStateOf("") }
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("New folder") },
+        text = { TextField(name, { name = it }, singleLine = true, placeholder = { Text("Folder name") }) },
+        confirmButton = { TextButton({ if (name.isNotBlank()) onCreate(name) }) { Text("Create") } },
+        dismissButton = { TextButton(onDismiss) { Text("Cancel") } }
+    )
+}
